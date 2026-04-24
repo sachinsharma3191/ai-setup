@@ -30,6 +30,8 @@ const CORE_MAX_TOKENS = 16000;
 const GENERATION_MAX_TOKENS = 64000;
 const MODEL_MAX_OUTPUT_TOKENS = 128000;
 const MAX_RETRIES = 5;
+/** Hard cap for `buildGeneratePrompt` sizing; avoids huge payloads when the model reports a very large context window. */
+const BUILD_GENERATE_PROMPT_MAX_TOKENS = 120_000;
 
 function isTransientError(error: Error): boolean {
   const msg = error.message.toLowerCase();
@@ -613,7 +615,7 @@ export function buildGeneratePrompt(
   if (fingerprint.codeAnalysis) {
     const ca = fingerprint.codeAnalysis;
     const basePrompt = parts.join('\n');
-    const maxPromptTokens = getMaxPromptTokens();
+    const maxPromptTokens = Math.min(getMaxPromptTokens(), BUILD_GENERATE_PROMPT_MAX_TOKENS);
     const baseTokens = estimateTokens(basePrompt);
     const tokenBudgetForCode = Math.max(0, maxPromptTokens - baseTokens);
 

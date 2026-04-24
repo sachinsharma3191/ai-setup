@@ -300,6 +300,128 @@ export function extractReferences(content: string): string[] {
 }
 
 /**
+ * Normalize a reference for in-repo resolution (scan + disk). Allows single-segment paths (e.g. `src`, `Dockerfile`).
+ */
+function normalizeResolvablePathRef(ref: string): string | null {
+  const normalized = ref.replace(/\\/g, '/').trim().replace(/^\.\//, '').replace(/[,;:!?)]+$/, '');
+  if (!normalized || normalized.includes('..') || normalized.includes('*')) return null;
+  if (/^https?:\/\//.test(normalized)) return null;
+  if (/^\d+\.\d+/.test(normalized)) return null;
+  if (normalized.startsWith('#')) return null;
+  if (normalized.startsWith('@') && (normalized.match(/\//g) || []).length === 1) return null;
+  return normalized;
+}
+
+/**
+ * Stricter filter for filesystem validation: skip refs that are not plausibly paths (accuracy check / score-refine).
+ */
+function filterValidatedPathReference(ref: string): string | null {
+  const normalized = normalizeResolvablePathRef(ref);
+  if (normalized === null) return null;
+  if (!normalized.includes('/') && !normalized.includes('.')) return null;
+  return normalized;
+}
+
+/**
+ * All contiguous path suffixes (e.g. a/b/c → a/b/c, b/c, c) for O(1) ref lookup vs scan.
+ */
+function buildProjectPathSuffixIndex(
+  projectFiles: Iterable<string>,
+  projectDirs: Iterable<string>,
+): Set<string> {
+  const suffixes = new Set<string>();
+  for (const p of projectFiles) {
+    const parts = p.split('/').filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      suffixes.add(parts.slice(i).join('/'));
+    }
+  }
+  for (const p of projectDirs) {
+    const parts = p.split('/').filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      suffixes.add(parts.slice(i).join('/'));
+    }
+  }
+  return suffixes;
+}
+
+function pathReferenceResolvesInProjectWithSuffixIndex(
+  ref: string,
+  dir: string,
+  suffixIndex: ReadonlySet<string>,
+  checkExists: (path: string) => boolean,
+): boolean {
+  const normalized = normalizeResolvablePathRef(ref);
+  if (normalized === null) return false;
+
+  if (suffixIndex.has(normalized)) return true;
+
+  const fullPath = join(dir, normalized);
+  if (checkExists(fullPath)) {
+    try {
+      const st = statSync(fullPath);
+      return st.isFile() || st.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  const withoutTrailing = normalized.replace(/\/+$/, '');
+  if (withoutTrailing !== normalized) {
+    const p = join(dir, withoutTrailing);
+    if (checkExists(p)) {
+      try {
+        const st = statSync(p);
+        return st.isFile() || st.isDirectory();
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * True when a path-like reference matches the project scan or resolves under `dir` on disk.
+ * Stack-agnostic (no hardcoded “important” filenames).
+ */
+export function pathReferenceResolvesInProject(
+  ref: string,
+  dir: string,
+  projectFiles: ReadonlySet<string>,
+  projectDirs: ReadonlySet<string>,
+  checkExists: (path: string) => boolean = existsSync,
+): boolean {
+  const suffixIndex = buildProjectPathSuffixIndex(projectFiles, projectDirs);
+  return pathReferenceResolvesInProjectWithSuffixIndex(ref, dir, suffixIndex, checkExists);
+}
+
+/**
+ * Weight path-like references for reference-density: resolved refs count double (grounded in this repo).
+ */
+export function sumPathReferenceDensityWeights(
+  refs: readonly string[],
+  dir: string,
+  projectFiles: ReadonlySet<string>,
+  projectDirs: ReadonlySet<string>,
+  checkExists: (path: string) => boolean = existsSync,
+): { weightedSum: number; resolvedCount: number } {
+  const suffixIndex = buildProjectPathSuffixIndex(projectFiles, projectDirs);
+  let weightedSum = 0;
+  let resolvedCount = 0;
+  for (const r of refs) {
+    if (pathReferenceResolvesInProjectWithSuffixIndex(r, dir, suffixIndex, checkExists)) {
+      weightedSum += 2;
+      resolvedCount++;
+    } else {
+      weightedSum += 1;
+    }
+  }
+  return { weightedSum, resolvedCount };
+}
+
+/**
  * Validate extracted references against the filesystem.
  * Shared by both the scoring accuracy check and the score-refine loop.
  */
@@ -313,18 +435,15 @@ export function validateFileReferences(
   const invalid: string[] = [];
 
   for (const ref of refs) {
-    if (/^https?:\/\//.test(ref)) continue;
-    if (/^\d+\.\d+/.test(ref)) continue;
-    if (ref.startsWith('#') || ref.startsWith('@')) continue;
-    if (ref.includes('*') || ref.includes('..')) continue;
-    if (!ref.includes('/') && !ref.includes('.')) continue;
+    const normalized = filterValidatedPathReference(ref);
+    if (normalized === null) continue;
 
-    const fullPath = join(dir, ref);
+    const fullPath = join(dir, normalized);
     if (checkExists(fullPath)) {
       valid.push(ref);
     } else {
-      const withoutTrailing = ref.replace(/\/+$/, '');
-      if (withoutTrailing !== ref && checkExists(join(dir, withoutTrailing))) {
+      const withoutTrailing = normalized.replace(/\/+$/, '');
+      if (withoutTrailing !== normalized && checkExists(join(dir, withoutTrailing))) {
         valid.push(ref);
       } else {
         invalid.push(ref);

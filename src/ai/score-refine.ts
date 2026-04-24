@@ -11,6 +11,7 @@ import {
   extractReferences,
   calculateDuplicatePercent,
   calculateDensityPoints,
+  sumPathReferenceDensityWeights,
   type ProjectStructure,
 } from '../scoring/utils.js';
 import {
@@ -226,10 +227,19 @@ export function validateSetup(
     }
   }
 
-  // 8. Reference density
+  // 8. Reference density (same weighting as checkGrounding: path-like refs double when they resolve in-repo)
   const allRefs = extractReferences(primaryContent);
   const primaryStructure = analyzeMarkdownStructure(primaryContent);
-  const totalSpecificRefs = allRefs.length + primaryStructure.inlineCodeCount;
+  const projectFiles = new Set(structure.files);
+  const projectDirs = new Set(structure.dirs);
+  const { weightedSum: weightedPathRefs, resolvedCount: refsResolvedInProject } = sumPathReferenceDensityWeights(
+    allRefs,
+    dir,
+    projectFiles,
+    projectDirs,
+    checkExists,
+  );
+  const totalSpecificRefs = weightedPathRefs + primaryStructure.inlineCodeCount;
   const density = primaryStructure.nonEmptyLines > 0
     ? (totalSpecificRefs / primaryStructure.nonEmptyLines) * 100
     : 0;
@@ -239,8 +249,8 @@ export function validateSetup(
   if (densityLost > 0) {
     issues.push({
       check: 'Reference density',
-      detail: `${totalSpecificRefs} references across ${primaryStructure.nonEmptyLines} lines (${Math.round(density)}% density, need ≥40% for full points)`,
-      fixInstruction: `Add more backtick references around file paths, commands, and identifiers. Use the dense reference style: \`src/api/\` routes · \`src/models/\` data. Current density: ${Math.round(density)}%, target: ≥40%.`,
+      detail: `${totalSpecificRefs} reference units (${allRefs.length} path-like, ${refsResolvedInProject} resolve in-repo) across ${primaryStructure.nonEmptyLines} lines (${Math.round(density)}% density, need ≥40% for full points)`,
+      fixInstruction: `Add more backtick references around file paths, commands, and identifiers. Use the dense reference style: \`src/api/\` routes · \`src/models/\` data. Prefer paths that exist in this repo (they count double toward density). Current density: ${Math.round(density)}%, target: ≥40%.`,
       pointsLost: densityLost,
     });
   }
